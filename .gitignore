@@ -1,0 +1,38 @@
+# Dependency directories
+node_modules/
+webview-ui/node_modules/
+
+# Build outputs
+out/
+dist/
+webview-ui/dist/
+*.vsix
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Python environment & cache
+server/.venv/
+**/__pycache__/
+*.pyc
+
+# Local runtime agents data & server caches
+server/.agents/
+server/.agents_brain/
+server/mem.pkl
+server/scratch/*
+!server/scratch/.gitkeep
+server/tools/*
+!server/tools/.gitkeep
+.agents/
+.agents_brain/
+mem.pkl
+
+# Gemini-specific local chat session & server run files
+.gemini/mlx_mcp_server.pid
+.gemini/chat_session.pkl
+.gemini/agents/
+
+# Log files
+*.log

@@ -1,0 +1,58 @@
+{
+  "name": "mlx-chat",
+  "displayName": "MLX Chat",
+  "description": "Chat directly with your local MLX model via the MCP server",
+  "version": "0.2.0",
+  "publisher": "rnewquist",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:mlxChatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mlx-chat-container",
+          "title": "MLX Chat",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
+    "views": {
+      "mlx-chat-container": [
+        {
+          "type": "webview",
+          "id": "mlxChatView",
+          "name": "MLX Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "mlx-chat.resetSystem",
+        "title": "MLX Chat: Reset System"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.7.0"
+  }
+}
