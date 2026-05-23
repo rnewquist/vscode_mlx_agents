@@ -19,7 +19,7 @@ export class McpClient {
     public static extensionPath: string = "";
 
     private get serverRoot(): string {
-        return McpClient.extensionPath || "/Users/rnewquist/Documents/mlx";
+        return McpClient.extensionPath || path.join(__dirname, "..");
     }
 
     private get serverScriptPath(): string {

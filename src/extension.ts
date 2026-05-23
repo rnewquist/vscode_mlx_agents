@@ -2,8 +2,6 @@ import * as vscode from "vscode";
 import { McpClient } from "./mcpClient.js";
 import { getChatHtml } from "./chatView.js";
 
-const FALLBACK_MLX_ROOT = "/Users/rnewquist/Documents/mlx";
-
 let mcpClient: McpClient | null = null;
 
 interface ChatMessage {
