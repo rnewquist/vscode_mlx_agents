@@ -6,3 +6,26 @@ node_modules/**
 tsconfig.json
 **/*.ts
 **/*.map
+.gemini/**
+progress.md
+*.vsix
+
+# Exclude heavy development webview UI files except the production build
+webview-ui/node_modules/**
+webview-ui/src/**
+webview-ui/public/**
+webview-ui/tsconfig*.json
+webview-ui/vite.config.ts
+webview-ui/eslint.config.js
+webview-ui/package*.json
+webview-ui/README.md
+webview-ui/.gitignore
+
+# Exclude local python venv, dynamic agent runtimes, and caching
+server/.venv/**
+server/.agents/**
+server/.agents_brain/**
+server/__pycache__/**
+server/mem.pkl
+server/scratch/**
+server/tools/**
