@@ -37,6 +37,39 @@
       {
         "command": "mlx-chat.resetSystem",
         "title": "MLX Chat: Reset System"
+      },
+      {
+        "command": "mlx-chat.sendSelection",
+        "title": "Ask MLX"
+      },
+      {
+        "command": "mlx-chat.explainSelection",
+        "title": "Explain with MLX"
+      },
+      {
+        "command": "mlx-chat.focusChat",
+        "title": "MLX Chat: Focus Chat Panel"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "mlx-chat.sendSelection",
+          "when": "editorHasSelection",
+          "group": "mlx@1"
+        },
+        {
+          "command": "mlx-chat.explainSelection",
+          "when": "editorHasSelection",
+          "group": "mlx@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "mlx-chat.focusChat",
+        "key": "ctrl+shift+m",
+        "mac": "cmd+shift+m"
       }
     ]
   },

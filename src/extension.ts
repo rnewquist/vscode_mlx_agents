@@ -3,8 +3,15 @@ import { McpClient } from "./mcpClient.js";
 import { getChatHtml } from "./chatView.js";
 
 let mcpClient: McpClient | null = null;
+let chatProvider: MlxChatViewProvider | null = null;
+
+let _idCounter = 0;
+function generateId(): string {
+    return `msg_${Date.now()}_${_idCounter++}`;
+}
 
 interface ChatMessage {
+    id: string;
     role: "user" | "assistant" | "system";
     text: string;
     timestamp: number;
@@ -13,6 +20,7 @@ interface ChatMessage {
 export function activate(context: vscode.ExtensionContext) {
     McpClient.extensionPath = context.extensionPath;
     const provider = new MlxChatViewProvider(context);
+    chatProvider = provider;
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider("mlxChatView", provider, {
@@ -28,10 +36,42 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Send selected editor text as a prompt
+    context.subscriptions.push(
+        vscode.commands.registerCommand("mlx-chat.sendSelection", async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) return;
+            const selection = editor.document.getText(editor.selection);
+            if (selection.trim()) {
+                chatProvider?.sendProgrammatic(selection.trim());
+            }
+        })
+    );
+
+    // Send selection with "Explain this code:" prefix
+    context.subscriptions.push(
+        vscode.commands.registerCommand("mlx-chat.explainSelection", async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) return;
+            const selection = editor.document.getText(editor.selection);
+            if (selection.trim()) {
+                chatProvider?.sendProgrammatic(`Explain this code:\n\n\`\`\`\n${selection.trim()}\n\`\`\``);
+            }
+        })
+    );
+
+    // Focus the chat panel
+    context.subscriptions.push(
+        vscode.commands.registerCommand("mlx-chat.focusChat", () => {
+            vscode.commands.executeCommand("mlxChatView.focus");
+        })
+    );
+
     context.subscriptions.push({
         dispose: () => {
             mcpClient?.dispose();
             mcpClient = null;
+            chatProvider = null;
         },
     });
 }
@@ -271,8 +311,27 @@ class MlxChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    /**
+     * Send a message programmatically (e.g. from editor context menu).
+     */
+    public sendProgrammatic(text: string) {
+        this.handleUserMessage(text);
+        this._view?.webview.postMessage({
+            type: "response",
+            text: "", // will be filled by the response cycle
+        });
+        // Also push to the webview so it shows in the message list
+        this._view?.webview.postMessage({
+            type: "restoreHistory",
+            messages: [...this._messages, { id: generateId(), role: "user", text, timestamp: Date.now() }],
+        });
+    }
+
     private pushMessage(role: ChatMessage["role"], text: string) {
-        // Only persist actual user/assistant dialogue
+        // Filter out empty / whitespace-only messages
+        if (!text.trim()) return;
+
+        // Filter system/status messages from persisted history
         const dialogueFilters = [
             "Model changed to",
             "Checking model availability",
@@ -280,9 +339,14 @@ class MlxChatViewProvider implements vscode.WebviewViewProvider {
             "Successfully applied",
             "Resolved",
             "Changes accepted",
-            "Changes rejected"
+            "Changes rejected",
+            "Loading model",
+            "Processing...",
+            "Thinking...",
+            "Run finished with no output",
+            "Session history cleared",
         ];
-        
+
         if (role === "assistant") {
             if (dialogueFilters.some(filter => text.includes(filter))) {
                 console.log("Extension: Filtering system message from history:", text);
@@ -290,7 +354,15 @@ class MlxChatViewProvider implements vscode.WebviewViewProvider {
             }
         }
 
-        this._messages.push({ role, text, timestamp: Date.now() });
+        // Timestamp-based dedup: skip if same role + same text within 2s
+        const now = Date.now();
+        const last = this._messages[this._messages.length - 1];
+        if (last && last.role === role && last.text === text && (now - last.timestamp) < 2000) {
+            console.log("Extension: Deduplicating message:", text.substring(0, 50));
+            return;
+        }
+
+        this._messages.push({ id: generateId(), role, text, timestamp: now });
         this.persistMessages();
     }
 
