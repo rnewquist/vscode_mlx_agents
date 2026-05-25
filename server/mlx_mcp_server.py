@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import logging
 import traceback
 import time
@@ -9,17 +10,170 @@ import io
 import pickle
 import uuid
 
-# Immediately redirect stdout to stderr to prevent rogue prints (from imports or global code) 
-# from corrupting the MCP JSON-RPC stream on stdout.
+# ── Stdout protection ──
+# MCP uses stdio (stdout) for JSON-RPC. Any non-JSON output on stdout from
+# rich, smolagents, or model libraries will corrupt the transport.
+# We create a guarded stdout that ONLY allows writes from the MCP thread.
 _real_stdout = sys.stdout
-sys.stdout = sys.stderr
+_real_stderr = sys.stderr
 
-# Disable rich banners that corrupt the stdio JSON-RPC stream
+class _MCPGuardedStdout:
+    """Stdout wrapper that redirects all writes to stderr unless
+    the current thread is the designated MCP I/O thread."""
+    def __init__(self, real_stdout, fallback):
+        self._real = real_stdout
+        self._fallback = fallback
+        self._mcp_thread_id = None  # set once MCP starts
+
+    def register_mcp_thread(self):
+        self._mcp_thread_id = threading.current_thread().ident
+
+    def write(self, data):
+        if self._mcp_thread_id and threading.current_thread().ident == self._mcp_thread_id:
+            return self._real.write(data)
+        # Dynamically write to sys.stderr so it routes through StderrTee
+        return sys.stderr.write(data)
+
+    def flush(self):
+        self._real.flush()
+        self._fallback.flush()
+
+    def fileno(self):
+        return self._real.fileno()
+
+    # Forward any other attribute access to the real stdout
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+class LogCapturingStream:
+    """A thread-safe string stream that emulates terminal carriage returns (\r)
+    in-place to prevent duplicate log bloat in UI stream logs."""
+    def __init__(self, fallback_stream=None):
+        self.lines = [""]
+        self.fallback_stream = fallback_stream
+        self._lock = threading.Lock()
+
+    def write(self, s):
+        if self.fallback_stream:
+            self.fallback_stream.write(s)
+            self.fallback_stream.flush()
+        
+        with self._lock:
+            for char in s:
+                if char == '\r':
+                    self.lines[-1] = ""
+                elif char == '\n':
+                    self.lines.append("")
+                else:
+                    self.lines[-1] += char
+
+    def flush(self):
+        if self.fallback_stream:
+            self.fallback_stream.flush()
+
+    def getvalue(self):
+        with self._lock:
+            return "\n".join(self.lines)
+
+class StderrTee:
+    """A thread-local stderr multiplexer that writes to both the real stderr
+    and a stack of registered callbacks (if set) for the current thread."""
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+        self.thread_local = threading.local()
+
+    def set_callback(self, callback):
+        if not hasattr(self.thread_local, 'callbacks'):
+            self.thread_local.callbacks = []
+        self.thread_local.callbacks.append(callback)
+
+    def clear_callback(self):
+        if hasattr(self.thread_local, 'callbacks') and self.thread_local.callbacks:
+            self.thread_local.callbacks.pop()
+
+    def write(self, data):
+        self.original_stderr.write(data)
+        if hasattr(self.thread_local, 'callbacks') and self.thread_local.callbacks:
+            callback = self.thread_local.callbacks[-1]
+            if callback:
+                try:
+                    callback(data)
+                except Exception:
+                    pass
+
+    def flush(self):
+        self.original_stderr.flush()
+
+    def fileno(self):
+        return self.original_stderr.fileno()
+
+    def isatty(self):
+        return self.original_stderr.isatty()
+
+    def __getattr__(self, name):
+        return getattr(self.original_stderr, name)
+
+_guarded_stdout = _MCPGuardedStdout(_real_stdout, _real_stderr)
+sys.stdout = _guarded_stdout
+
+_stderr_tee = StderrTee(_real_stderr)
+sys.stderr = _stderr_tee
+
+# Disable rich banners / color that corrupt the stdio JSON-RPC stream
 os.environ["NO_COLOR"] = "1"
 os.environ["TERM"] = "dumb"
 
 import fastmcp
-from smolagents import CodeAgent, MLXModel, DuckDuckGoSearchTool
+from smolagents import DuckDuckGoSearchTool
+from smolagents.models import ChatMessage, MessageRole, TokenUsage, remove_content_after_stop_sequences
+from smolagents import MLXModel as SmolMLXModel
+
+_thread_context = threading.local()
+
+class MLXModel(SmolMLXModel):
+    """Subclass of MLXModel that supports real-time cancellation during token generation."""
+    def generate(self, messages, stop_sequences=None, response_format=None, tools_to_call_from=None, **kwargs):
+        if response_format is not None:
+            raise ValueError("MLX does not support structured outputs.")
+        completion_kwargs = self._prepare_completion_kwargs(
+            messages=messages,
+            stop_sequences=stop_sequences,
+            tools_to_call_from=tools_to_call_from,
+            **kwargs,
+        )
+        messages = completion_kwargs.pop("messages")
+        stops = completion_kwargs.pop("stop", [])
+        tools = completion_kwargs.pop("tools", None)
+        completion_kwargs.pop("tool_choice", None)
+
+        prompt_ids = self.tokenizer.apply_chat_template(messages, tools=None, **self.apply_chat_template_kwargs)
+
+        output_tokens = 0
+        text = ""
+        for response in self.stream_generate(self.model, self.tokenizer, prompt=prompt_ids, **completion_kwargs):
+            # Check for real-time interruption!
+            active_agent = getattr(_thread_context, "active_agent", None)
+            if active_agent and getattr(active_agent, "interrupt_switch", False):
+                _real_stderr.write("MLXModel: Generation interrupted in-loop by user request!\n")
+                raise RuntimeError("Generation interrupted by user request.")
+
+            output_tokens += 1
+            text += response.text
+            if any((stop_index := text.rfind(stop)) != -1 for stop in stops):
+                text = text[:stop_index]
+                break
+        if stop_sequences is not None and not self.supports_stop_parameter:
+            text = remove_content_after_stop_sequences(text, stop_sequences)
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=text,
+            raw={"out": text, "completion_kwargs": completion_kwargs},
+            token_usage=TokenUsage(
+                input_tokens=len(prompt_ids),
+                output_tokens=output_tokens,
+            ),
+        )
+
 try:
     import mlx.core as mx
 except ImportError:
@@ -97,47 +251,162 @@ def get_system_status() -> str:
     import json
     return json.dumps(get_system_status_info())
 
-def get_mlx_model():
+# ── Chat template fallbacks for models that don't ship with one ──
+
+_CHATML_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "{{'<|im_start|>assistant\n'}}"
+    "{% endif %}"
+)
+
+_GEMMA_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'assistant' %}"
+    "{{'<start_of_turn>model\n' + message['content'] + '<end_of_turn>\n'}}"
+    "{% elif message['role'] == 'system' %}"
+    "{{'<start_of_turn>user\n' + message['content'] + '<end_of_turn>\n'}}"
+    "{% else %}"
+    "{{'<start_of_turn>' + message['role'] + '\n' + message['content'] + '<end_of_turn>\n'}}"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "{{'<start_of_turn>model\n'}}"
+    "{% endif %}"
+)
+
+_LLAMA_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}"
+    "{{'<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>'}}"
+    "{% elif message['role'] == 'user' %}"
+    "{{'<|start_header_id|>user<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>'}}"
+    "{% else %}"
+    "{{'<|start_header_id|>assistant<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>'}}"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "{{'<|start_header_id|>assistant<|end_header_id|>\n\n'}}"
+    "{% endif %}"
+)
+
+def _pick_chat_template(model_id: str) -> tuple[str, str]:
+    """Return (template_string, family_name) based on model ID heuristics."""
+    mid = model_id.lower()
+    if "gemma" in mid:
+        return _GEMMA_TEMPLATE, "Gemma"
+    if "llama" in mid:
+        return _LLAMA_TEMPLATE, "Llama"
+    return _CHATML_TEMPLATE, "ChatML"
+
+def _get_model_family(model_id: str) -> str:
+    mid = model_id.lower()
+    if "gemma" in mid:
+        return "gemma"
+    if "llama" in mid:
+        return "llama"
+    if "qwen" in mid:
+        return "qwen"
+    return "unknown"
+
+def _is_instruct_model(model_id: str) -> bool:
+    """Check if model ID suggests an instruction-tuned variant."""
+    mid = model_id.lower()
+    instruct_markers = ["-it-", "-it.", "-instruct", "-chat", "instruct-"]
+    return any(m in mid for m in instruct_markers)
+
+def get_mlx_model(log_fn=None):
+    """Load (or return cached) MLX model. log_fn(msg) is called with progress strings."""
     global _mlx_model_instance, _current_model_id
+
+    def _log(msg):
+        _real_stderr.write(msg + "\n")
+        if log_fn:
+            log_fn(msg + "\n")
+
     if _mlx_model_instance is None:
-        status = get_system_status_info()
-        sys.stderr.write(f"Server: Loading MLX model ({_current_model_id}). Current RAM: {status['ram_usage_mb']}MB\n")
-        import os
-        
-        load_kwargs = {}
-        models_config = memory.get_models_config()
-        
-        # Check if we have a custom adapter path for this model
-        if _current_model_id in models_config:
-            adapter_path = models_config[_current_model_id].get("adapter_path")
-            if adapter_path and os.path.exists(adapter_path):
-                sys.stderr.write(f"Loading LoRA adapter from {adapter_path}...\n")
-                load_kwargs["adapter_path"] = adapter_path
-        elif "Qwen" in _current_model_id:
-            # Fallback to hardcoded path for Qwen if no config exists (backward compatibility)
-            fallback_adapter_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen_lora", "adapters_hf")
-            if os.path.exists(fallback_adapter_path):
-                sys.stderr.write(f"Loading fallback LoRA adapter from {fallback_adapter_path}...\n")
-                load_kwargs["adapter_path"] = fallback_adapter_path
-            
-        # Load the MLX model natively into your M5's unified memory.
-        _mlx_model_instance = MLXModel(
-            _current_model_id,
-            load_kwargs=load_kwargs,
-            max_tokens=4096
-        )
-        
-        status = get_system_status_info()
-        sys.stderr.write(f"MLXModel object created. RAM usage: {status['ram_usage_mb']}MB\n")
-        
-        # Force a tiny generation to ensure weights are actually mapped into RAM
+        if log_fn:
+            sys.stderr.set_callback(log_fn)
         try:
-            sys.stderr.write("Performing model warmup generation...\n")
-            _mlx_model_instance([{"role": "user", "content": "Hi"}], max_new_tokens=1)
             status = get_system_status_info()
-            sys.stderr.write(f"Warmup complete. Final RAM usage: {status['ram_usage_mb']}MB\n")
-        except Exception as e:
-            sys.stderr.write(f"Warmup failed (but model might still work): {e}\n")
+            _log(f"Loading MLX model: {_current_model_id}  (RAM: {status['ram_usage_mb']}MB)")
+
+            family = _get_model_family(_current_model_id)
+
+            # Warn about base (non-instruct) models
+            if not _is_instruct_model(_current_model_id):
+                _log("⚠ WARNING: This appears to be a base model (not instruction-tuned).")
+                _log("  Base models may produce incoherent or runaway output.")
+                _log("  Recommended: use an '-it-' or '-Instruct' variant instead.")
+
+            load_kwargs = {}
+            models_config = memory.get_models_config()
+
+            # Check if we have a custom adapter path for this model
+            if _current_model_id in models_config:
+                adapter_path = models_config[_current_model_id].get("adapter_path")
+                if adapter_path and os.path.exists(adapter_path):
+                    _log(f"Loading LoRA adapter from {adapter_path}...")
+                    load_kwargs["adapter_path"] = adapter_path
+            elif "Qwen" in _current_model_id:
+                fallback_adapter_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen_lora", "adapters_hf")
+                if os.path.exists(fallback_adapter_path):
+                    _log(f"Loading fallback LoRA adapter from {fallback_adapter_path}...")
+                    load_kwargs["adapter_path"] = fallback_adapter_path
+
+            _log("Downloading/loading model weights into unified memory...")
+
+            # Build model-family-specific kwargs
+            chat_template_kwargs = {"add_generation_prompt": True}
+
+            # Load the MLX model natively into unified memory.
+            _mlx_model_instance = MLXModel(
+                _current_model_id,
+                load_kwargs=load_kwargs,
+                apply_chat_template_kwargs=chat_template_kwargs,
+                max_tokens=4096
+            )
+
+            # Fix models that ship without a chat_template
+            try:
+                tokenizer = _mlx_model_instance.tokenizer
+                if not getattr(tokenizer, "chat_template", None):
+                    template, tpl_name = _pick_chat_template(_current_model_id)
+                    _log(f"⚠ Tokenizer has no chat_template — applying {tpl_name} template.")
+                    tokenizer.chat_template = template
+            except Exception as e:
+                _log(f"Warning: could not inspect tokenizer chat_template: {e}")
+
+            # Ensure proper EOS tokens for the model family
+            try:
+                tokenizer = _mlx_model_instance.tokenizer
+                if family == "gemma":
+                    # Gemma uses <end_of_turn> as its stop token
+                    eos_token = "<end_of_turn>"
+                    eos_id = tokenizer.convert_tokens_to_ids(eos_token)
+                    if eos_id and eos_id != tokenizer.unk_token_id:
+                        tokenizer.eos_token = eos_token
+                        tokenizer.eos_token_id = eos_id
+                        _log(f"Set EOS token to {eos_token} (id={eos_id})")
+            except Exception as e:
+                _log(f"Warning: could not set model-specific EOS token: {e}")
+
+            status = get_system_status_info()
+            _log(f"Model object created. RAM usage: {status['ram_usage_mb']}MB")
+
+            # Force a tiny generation to ensure weights are actually mapped into RAM
+            try:
+                _log("Running warmup generation...")
+                _mlx_model_instance([{"role": "user", "content": [{"type": "text", "text": "Hi"}]}], max_tokens=1)
+                status = get_system_status_info()
+                _log(f"✓ Warmup complete. Final RAM: {status['ram_usage_mb']}MB")
+            except Exception as e:
+                _log(f"⚠ Warmup failed (model might still work): {e}")
+        finally:
+            if log_fn:
+                sys.stderr.clear_callback()
 
     return _mlx_model_instance
 
@@ -256,9 +525,11 @@ def get_main_brain_tool(memory, workspace_path=""):
     return tool
 
 # Main Agent system prompt
-MAIN_AGENT_SYSTEM_PROMPT = """You are MLX, a local AI assistant running on Apple Silicon. Be concise and helpful.
-You can use tools to edit files, search the web, run commands, and manage subagents.
-Use update_my_brain to remember important facts across sessions."""
+MAIN_AGENT_SYSTEM_PROMPT = """You are MLX, a local AI assistant running natively on Apple Silicon.
+Be concise and helpful. You have access to tools for file editing, web search, terminal commands,
+and multi-agent delegation. Use update_my_brain to remember important facts across sessions.
+When the user asks a simple question, answer directly using final_answer.
+For complex tasks, break them into steps and use your tools."""
 
 
 def _get_workspace_agent(workspace_path: str, brain_context: str, clear_history: bool):
@@ -285,13 +556,17 @@ def _get_workspace_agent(workspace_path: str, brain_context: str, clear_history:
         return agent
 
     # Initialize a new agent
+    # Use ToolCallingAgent instead of CodeAgent — it works reliably across model
+    # families (Gemma, Llama, Qwen) without requiring models to produce exact
+    # <code>...</code> block formatting that many local models get wrong.
+    from smolagents import ToolCallingAgent
+
     main_brain = get_main_brain_tool(memory, workspace_path)
     all_tools = get_shared_tools(workspace_path=workspace_path) + get_management_tools(agents_registry, memory, workspace_path=workspace_path) + [main_brain]
 
-    agent = CodeAgent(
+    agent = ToolCallingAgent(
         model=get_mlx_model(),
         tools=all_tools,
-        add_base_tools=False,
     )
     
     # Try to load memory from disk
@@ -300,13 +575,13 @@ def _get_workspace_agent(workspace_path: str, brain_context: str, clear_history:
             with open(session_file, "rb") as f:
                 saved_memory = pickle.load(f)
                 agent.memory = saved_memory
-                sys.stderr.write(f"Successfully restored session memory from {session_file}\n")
+                _real_stderr.write(f"Successfully restored session memory from {session_file}\n")
         except Exception as e:
-            sys.stderr.write(f"Failed to load session memory (likely corrupted): {e}\n")
+            _real_stderr.write(f"Failed to load session memory (likely corrupted): {e}\n")
             # If pickle is corrupted, we already have a fresh agent.memory from CodeAgent init
             try:
                 os.remove(session_file)
-                sys.stderr.write("Deleted corrupted session memory file.\n")
+                _real_stderr.write("Deleted corrupted session memory file.\n")
             except OSError:
                 pass
             
@@ -324,32 +599,55 @@ class AgentRunManager:
 
     def start_run(self, workspace_path: str, brain_context: str, prompt: str) -> str:
         run_id = str(uuid.uuid4())
-        log_capture = io.StringIO()
+        log_capture = LogCapturingStream()
         
         def _run_worker():
             telemetry_manager.update_node_status("root", "thinking")
+            sys.stderr.set_callback(log_capture.write)
+            agent = None
             try:
-                log_capture.write("Checking model availability and initializing MLX...\n")
+                log_capture.write("Initializing MLX model...\n")
                 sys.stderr.write(f"Thread-{run_id}: Requesting MLX model...\n")
                 
+                # Pre-load model with progress piped to the webview
+                get_mlx_model(log_fn=log_capture.write)
+                
+                log_capture.write("Creating agent session...\n")
                 agent = _get_workspace_agent(workspace_path, brain_context, clear_history=False)
+                
+                # Store active agent in thread context for dynamic interruption
+                _thread_context.active_agent = agent
                 
                 with self.lock:
                     self.runs[run_id]['agent'] = agent
 
-                log_capture.write(f"MLX Model loaded. Starting generation...\n")
+                log_capture.write("Starting generation...\n")
                 sys.stderr.write(f"Thread-{run_id}: Starting agent.run()...\n")
                 response = agent.run(prompt, max_steps=30, reset=False)                
                 with self.lock:
                     self.runs[run_id]['status'] = "completed"
                     self.runs[run_id]['response'] = response
             except Exception as e:
-                sys.stderr.write(f"Thread-{run_id} Error: {e}\n")
-                traceback.print_exc(file=sys.stderr)
-                with self.lock:
-                    self.runs[run_id]['status'] = "error"
-                    self.runs[run_id]['response'] = f"Error: {e}\n\nTraceback:\n{traceback.format_exc()}"
+                is_interrupted = False
+                if agent and getattr(agent, "interrupt_switch", False):
+                    is_interrupted = True
+                
+                if is_interrupted:
+                    sys.stderr.write(f"Thread-{run_id}: Run interrupted by user.\n")
+                    with self.lock:
+                        self.runs[run_id]['status'] = "completed"
+                        self.runs[run_id]['response'] = "Generation interrupted by user."
+                else:
+                    sys.stderr.write(f"Thread-{run_id} Error: {e}\n")
+                    traceback.print_exc(file=sys.stderr)
+                    with self.lock:
+                        self.runs[run_id]['status'] = "error"
+                        self.runs[run_id]['response'] = f"Error: {e}\n\nTraceback:\n{traceback.format_exc()}"
             finally:
+                # Clear thread context and stderr callback
+                if hasattr(_thread_context, "active_agent"):
+                    del _thread_context.active_agent
+                sys.stderr.clear_callback()
                 memory.flush_to_disk()
                 telemetry_manager.update_node_status("root", "idle")
                 
@@ -543,15 +841,10 @@ def agent_query(prompt: str, agent_name: str = "default", max_tokens: int = 1024
         _last_query_time = time.time()
 
     try:
-        from smolagents import CodeAgent
-        agent = CodeAgent(
+        from smolagents import ToolCallingAgent
+        agent = ToolCallingAgent(
             model=get_mlx_model(),
-            # For subagent queries, we don't have a specific workspace_path context easily available,
-            # but we can try to infer it or just pass None to be safe.
-            # Actually, we should probably pass the same workspace context as the main agent.
-            # For now, let's keep it restricted by default.
-            tools=get_shared_tools(workspace_path=None), 
-            add_base_tools=True
+            tools=get_shared_tools(workspace_path=None),
         )
 
         log_capture = io.StringIO()
@@ -622,13 +915,29 @@ if __name__ == "__main__":
         f.write(str(my_pid))
 
     try:
+        # Register this thread as the sole MCP I/O thread
+        # Only this thread's writes will reach the real stdout
+        _guarded_stdout.register_mcp_thread()
+
+        # Force rich's default console to stderr (belt + suspenders)
+        try:
+            import rich.console
+            rich.console.Console._default_file = _real_stderr
+        except Exception:
+            pass
+        try:
+            from rich.console import Console
+            # Monkey-patch the default console used by smolagents/rich
+            import rich
+            rich.get_console = lambda: Console(file=_real_stderr, force_terminal=False)
+        except Exception:
+            pass
+
         # FastMCP handles the stdio transport layer automatically
-        # Restore stdout just before running the server
-        sys.stdout = _real_stdout
         mcp.run(transport='stdio', show_banner=False)
     except Exception as e:
-        sys.stderr.write(f"MCP Server crashed: {e}\n")
-        traceback.print_exc(file=sys.stderr)
+        _real_stderr.write(f"MCP Server crashed: {e}\n")
+        traceback.print_exc(file=_real_stderr)
     finally:
         # Clean up PID file if we are the ones who wrote it
         try:
